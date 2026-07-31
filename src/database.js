@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 
 const dbPath = path.join(__dirname, '..', 'data', 'bot.json');
+const dbDir = path.dirname(dbPath);
 
 function defaultData() {
   return {
@@ -30,14 +31,51 @@ function loadData() {
     fs.writeFileSync(dbPath, JSON.stringify(initial, null, 2));
     return initial;
   }
-  const raw = fs.readFileSync(dbPath, 'utf8');
-  const parsed = JSON.parse(raw);
-  // Fill in any new fields that didn't exist in older versions of the data file.
-  return { ...defaultData(), ...parsed };
+
+  let raw;
+  try {
+    raw = fs.readFileSync(dbPath, 'utf8');
+  } catch (err) {
+    console.error('❌ Could not read data file, starting fresh:', err.message);
+    const initial = defaultData();
+    fs.writeFileSync(dbPath, JSON.stringify(initial, null, 2));
+    return initial;
+  }
+
+  try {
+    const parsed = JSON.parse(raw);
+    // Fill in any new fields that didn't exist in older versions of the data file.
+    return { ...defaultData(), ...parsed };
+  } catch (err) {
+    // File is corrupted (e.g. partial write during a crash).
+    // Back it up so data isn't lost, then start fresh rather than crashing.
+    const backupPath = dbPath + '.corrupted.' + Date.now();
+    console.error(
+      `❌ data/bot.json is corrupted (${err.message}). ` +
+        `Backing up to ${backupPath} and starting fresh. ` +
+        `You can restore from a /backup snapshot if you have one.`
+    );
+    try {
+      fs.copyFileSync(dbPath, backupPath);
+    } catch (backupErr) {
+      console.error('⚠️ Could not back up corrupted file:', backupErr.message);
+    }
+    const initial = defaultData();
+    fs.writeFileSync(dbPath, JSON.stringify(initial, null, 2));
+    return initial;
+  }
 }
 
+/**
+ * Atomic write: write to a temp file first, then rename over the real file.
+ * This prevents corruption if the process is killed mid-write, because the
+ * rename is atomic at the OS level - the file is either the old version or
+ * the new version, never a half-written mix of both.
+ */
 function saveData(data) {
-  fs.writeFileSync(dbPath, JSON.stringify(data, null, 2));
+  const tmpPath = dbPath + '.tmp';
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tmpPath, dbPath);
 }
 
 // ---------- Recruits ----------
@@ -67,9 +105,9 @@ function upsertRecruit(nationId, fields) {
     notes: null,
     last_contacted_at: null,
     created_at: new Date().toISOString(),
-    follow_up_stage: 0, // 0 = none sent, 1/2/3 = which follow-up has been sent
-    initial_template_id: null, // which template first contacted this recruit (for A/B testing)
-    initial_sent_by: null, // who/what sent that first contact ('system' for automated)
+    follow_up_stage: 0,
+    initial_template_id: null,
+    initial_sent_by: null,
   };
   data.recruits[key] = { ...existing, ...fields };
   saveData(data);
@@ -84,14 +122,9 @@ function touchLastContacted(nationId) {
   return upsertRecruit(nationId, { last_contacted_at: new Date().toISOString() });
 }
 
-/**
- * Records which template and sender first contacted this recruit - but only
- * if that hasn't already been recorded. This is what powers A/B testing and
- * join attribution: we want the FIRST contact's template, not any follow-up.
- */
 function setInitialAttributionIfMissing(nationId, templateId, sentBy) {
   const existing = getRecruit(nationId);
-  if (existing && existing.initial_template_id) return; // already recorded, don't overwrite
+  if (existing && existing.initial_template_id) return;
   upsertRecruit(nationId, { initial_template_id: templateId, initial_sent_by: sentBy });
 }
 
@@ -106,7 +139,7 @@ function addMailLog({ nationId, direction, subject, message, sentBy }) {
   data.mailLog.push({
     id: data.mailLog.length + 1,
     nation_id: nationId,
-    direction, // 'outgoing' or 'incoming'
+    direction,
     subject,
     message,
     sent_by: sentBy,
@@ -122,7 +155,7 @@ function getMailLog(nationId) {
     .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
 }
 
-// ---------- Known nation IDs (so the scanner never mails the same new nation twice) ----------
+// ---------- Known nation IDs ----------
 
 function isKnownNation(nationId) {
   const data = loadData();
@@ -135,11 +168,7 @@ function markNationKnown(nationId) {
   saveData(data);
 }
 
-// ---------- Known departure IDs (for the alliance-exit recruiting scanner) ----------
-// Separate tracking set from knownNationIds above - this one tracks established,
-// currently-unaligned nations so we can detect when a NEW one shows up (meaning
-// they likely just left an alliance, since we'd already know about them otherwise
-// if they'd been unaligned all along).
+// ---------- Known departure IDs ----------
 
 function isKnownDeparture(nationId) {
   const data = loadData();
@@ -161,10 +190,6 @@ function setDepartureBackfillDone() {
 }
 
 // ---------- Applicant/demotion tracker ----------
-// Stores snapshots of who was a full member last time we checked,
-// and who was already known as an applicant, so we can detect:
-// 1. NEW applicants (weren't in the applicant list before)
-// 2. DEMOTED members (were full members, now appear as applicant)
 
 function getKnownApplicants() {
   const data = loadData();
@@ -223,9 +248,6 @@ function getDemotionMessage() {
 }
 
 // ---------- Recruitment templates ----------
-// type can be: 'initial' (default - used for new-nation/bulk recruiting),
-// 'followup1' (sent ~3 days after first contact), 'followup2' (~7 days),
-// or 'followup3' (~14 days, final follow-up).
 
 function addTemplate(id, { name, subject, body, type }) {
   const data = loadData();
@@ -253,8 +275,6 @@ function getAllTemplates() {
 
 function getTemplatesByType(type) {
   const data = loadData();
-  // Templates saved before this feature existed have no `type` field at all -
-  // treat those as 'initial' so nothing old silently stops working.
   return Object.values(data.templates).filter((t) => (t.type || 'initial') === type);
 }
 
@@ -266,21 +286,12 @@ function deleteTemplate(id) {
   return existed;
 }
 
-/**
- * Picks a random template of the given type. Defaults to 'initial' (the
- * pool used by new-nation auto-recruit and bulk recruiting).
- * Returns null if no templates of that type exist.
- */
 function getRandomTemplate(type = 'initial') {
   const pool = getTemplatesByType(type);
   if (pool.length === 0) return null;
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
-/**
- * A/B testing report: for each template, how many recruits it first-contacted,
- * and how many of those recruits ended up at stage "Joined".
- */
 function getTemplateStats() {
   const data = loadData();
   const recruits = Object.values(data.recruits);
@@ -300,10 +311,6 @@ function getTemplateStats() {
   });
 }
 
-/**
- * Join attribution report: for every recruit currently at stage "Joined",
- * which template and which sender (staff member or "system") first reached them.
- */
 function getJoinAttribution() {
   const data = loadData();
   return Object.values(data.recruits)
@@ -391,11 +398,6 @@ function getStats() {
 }
 
 // ---------- Personal API keys ----------
-// Lets individual staff members register their OWN PnW API key, so when
-// THEY send recruitment mail, it appears in-game as sent from their nation
-// instead of the bot owner's. Stored in the same local data file as
-// everything else - see the security note in the README before relying on
-// this for anything highly sensitive.
 
 function setPersonalApiKey(discordUserId, apiKey) {
   const data = loadData();
@@ -424,9 +426,6 @@ function hasPersonalApiKey(discordUserId) {
 }
 
 // ---------- Recruiter role gating ----------
-// Optional: if an admin sets a "recruiter role", only Administrators and
-// members with that role can use the mail-sending commands. If never set,
-// the commands stay open to everyone (same as before this feature existed).
 
 function setRecruiterRoleId(roleId) {
   setSetting('recruiterRoleId', roleId);
@@ -440,11 +439,6 @@ function setMailLogChannelId(channelId) {
   setSetting('mailLogChannelId', channelId);
 }
 
-/**
- * Returns the mail log channel ID - database setting takes priority over
- * the .env value, so /config mail-log-channel overrides the original setup
- * without requiring a restart or .env edit.
- */
 function getMailLogChannelId() {
   return getSetting('mailLogChannelId') || process.env.MAIL_LOG_CHANNEL_ID || null;
 }
